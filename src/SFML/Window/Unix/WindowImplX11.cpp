@@ -865,7 +865,9 @@ void WindowImplX11::setVideoMode(const VideoMode& mode)
     if (mode == VideoMode::getDesktopMode())
         return;
 
-    // Check if the XRandR extension is present
+    ScopedXcbPtr<xcb_generic_error_t> error(NULL);
+
+    // Check if the RandR extension is present
     static const std::string RANDR = "RANDR";
     ScopedXcbPtr<xcb_query_extension_reply_t> randr_ext(xcb_query_extension_reply(
         m_connection,
@@ -874,66 +876,97 @@ void WindowImplX11::setVideoMode(const VideoMode& mode)
             RANDR.size(),
             RANDR.c_str()
         ),
-        NULL
+        &error
     ));
 
-    if (randr_ext->present)
+    if (error || !randr_ext->present)
     {
-        // Get the current configuration
-        ScopedXcbPtr<xcb_generic_error_t> error(NULL);
-        ScopedXcbPtr<xcb_randr_get_screen_info_reply_t> config(xcb_randr_get_screen_info_reply(
-            m_connection,
-            xcb_randr_get_screen_info(
-                m_connection,
-                m_screen->root
-            ),
-            &error
-        ));
-
-        if (!error)
-        {
-            // Save the current video mode before we switch to fullscreen
-            m_oldVideoMode = config->sizeID;
-
-            // Get the available screen sizes
-            xcb_randr_screen_size_t* sizes = xcb_randr_get_screen_info_sizes(config.get());
-            if (sizes && (config->nSizes > 0))
-            {
-                // Search a matching size
-                for (int i = 0; i < config->nSizes; ++i)
-                {
-                    if ((sizes[i].width  == static_cast<int>(mode.width)) &&
-                        (sizes[i].height == static_cast<int>(mode.height)))
-                    {
-                        // Switch to fullscreen mode
-                        xcb_randr_set_screen_config(
-                            m_connection,
-                            m_screen->root,
-                            config->timestamp,
-                            config->config_timestamp,
-                            i,
-                            config->rotation,
-                            config->rate
-                        );
-
-                        // Set "this" as the current fullscreen window
-                        fullscreenWindow = this;
-                        break;
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Failed to get the screen configuration
-            err() << "Failed to get the current screen configuration for fullscreen mode, switching to window mode" << std::endl;
-        }
-    }
-    else
-    {
-        // XRandR extension is not supported: we cannot use fullscreen mode
+        // RandR extension is not supported: we cannot use fullscreen mode
         err() << "Fullscreen is not supported, switching to window mode" << std::endl;
+        return;
     }
+
+    // Load RandR and check its version
+    ScopedXcbPtr<xcb_randr_query_version_reply_t> randrVersion(xcb_randr_query_version_reply(
+        m_connection,
+        xcb_randr_query_version(
+            m_connection,
+            1,
+            1
+        ),
+        &error
+    ));
+
+    if (error)
+    {
+        err() << "Failed to load RandR, switching to window mode" << std::endl;
+        return;
+    }
+
+    // Get the current configuration
+    ScopedXcbPtr<xcb_randr_get_screen_info_reply_t> config(xcb_randr_get_screen_info_reply(
+        m_connection,
+        xcb_randr_get_screen_info(
+            m_connection,
+            m_screen->root
+        ),
+        &error
+    ));
+
+    if (error)
+    {
+        // Failed to get the screen configuration
+        err() << "Failed to get the current screen configuration for fullscreen mode, switching to window mode" << std::endl;
+        return;
+    }
+
+    // Save the current video mode before we switch to fullscreen
+    m_oldVideoMode = config->sizeID;
+
+    // Get the available screen sizes
+    xcb_randr_screen_size_t* sizes = xcb_randr_get_screen_info_sizes(config.get());
+
+    if (!sizes || !config->nSizes)
+    {
+        err() << "Failed to get the fullscreen sizes, switching to window mode" << std::endl;
+        return;
+    }
+
+    // Search for a matching size
+    for (int i = 0; i < config->nSizes; ++i)
+    {
+        if (config->rotation == XCB_RANDR_ROTATION_ROTATE_90 ||
+            config->rotation == XCB_RANDR_ROTATION_ROTATE_270)
+            std::swap(sizes[i].height, sizes[i].width);
+
+        if ((sizes[i].width  == static_cast<int>(mode.width)) &&
+            (sizes[i].height == static_cast<int>(mode.height)))
+        {
+            // Switch to fullscreen mode
+            ScopedXcbPtr<xcb_randr_set_screen_config_reply_t> setScreenConfig(xcb_randr_set_screen_config_reply(
+                m_connection,
+                xcb_randr_set_screen_config(
+                    m_connection,
+                    m_screen->root,
+                    XCB_CURRENT_TIME,
+                    config->config_timestamp,
+                    i,
+                    config->rotation,
+                    0//config->rate
+                ),
+                &error
+            ));
+
+            if (error)
+                err() << "Failed to set new screen configuration" << std::endl;
+
+            // Set "this" as the current fullscreen window
+            fullscreenWindow = this;
+            return;
+        }
+    }
+
+    err() << "Failed to find matching fullscreen size, switching to window mode" << std::endl;
 }
 
 
@@ -956,15 +989,22 @@ void WindowImplX11::resetVideoMode()
         if (!error)
         {
             // Reset the video mode
-            xcb_randr_set_screen_config(
+            ScopedXcbPtr<xcb_randr_set_screen_config_reply_t> setScreenConfig(xcb_randr_set_screen_config_reply(
                 m_connection,
-                m_screen->root,
-                CurrentTime,
-                config->config_timestamp,
-                m_oldVideoMode,
-                config->rotation,
-                config->rate
-            );
+                xcb_randr_set_screen_config(
+                    m_connection,
+                    m_screen->root,
+                    CurrentTime,
+                    config->config_timestamp,
+                    m_oldVideoMode,
+                    config->rotation,
+                    config->rate
+                ),
+                &error
+            ));
+
+            if (error)
+                err() << "Failed to reset old screen configuration" << std::endl;
         }
 
         // Reset the fullscreen window
